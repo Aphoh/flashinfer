@@ -751,3 +751,203 @@ def test_trtllm_batch_decode_mla_sparse(
         f"Sparse MLA test passed: batch_size={batch_size}, topk={topk}, "
         f"q_len={q_len_per_request}, varlen={is_varlen}, dtype={dtype}"
     )
+
+
+@pytest.mark.parametrize("batch_size", [1, 4, 32, 128])
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
+@pytest.mark.parametrize("q_len_per_request", [1, 2])
+@pytest.mark.parametrize("topk", [2048])
+@pytest.mark.parametrize("is_varlen", [False, True])
+@pytest.mark.parametrize("enable_pdl", [True, False])
+@pytest.mark.parametrize("backend", ["trtllm-gen"])
+def test_trtllm_batch_decode_mla_sparse_glm_moe_dsa(
+    batch_size: int,
+    dtype: torch.dtype,
+    q_len_per_request: int,
+    topk: int,
+    is_varlen: bool,
+    enable_pdl: bool,
+    backend: str,
+):
+    """
+    Test sparse MLA decoding with GLM-MoE-DSA model parameters.
+    Key differences from DeepSeek: qk_nope_head_dim=192, num_q_heads=64.
+    After matrix absorption the kernel sees the same d_qk=576, d_v=512.
+    """
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] != 10:
+        pytest.skip("TRTLLM-GEN MLA only supports SM100 and SM103 GPUs")
+
+    torch.manual_seed(42)
+    device = "cuda:0"
+
+    # GLM-MoE-DSA attention config (decode-MLA, post matrix absorption)
+    num_q_heads = 64  # differs from DeepSeek (128)
+    qk_nope_head_dim = 192  # differs from DeepSeek (128)
+    qk_rope_head_dim = 64
+    kv_lora_rank = 512
+    scale = 1.0
+
+    # After absorption: d_qk = kv_lora_rank + qk_rope_head_dim = 576
+    # After absorption: d_v  = kv_lora_rank = 512
+
+    if is_varlen:
+        MAX_SEQ_LEN = 4096
+        seq_lens = [
+            max(
+                topk,
+                int(
+                    torch.distributions.Normal(MAX_SEQ_LEN, MAX_SEQ_LEN / 2)
+                    .sample()
+                    .item()
+                ),
+            )
+            for _ in range(batch_size)
+        ]
+        seq_lens[-1] = MAX_SEQ_LEN
+        seq_lens = [min(s, MAX_SEQ_LEN) for s in seq_lens]
+    else:
+        MAX_SEQ_LEN = 4096
+        seq_lens = [MAX_SEQ_LEN] * batch_size
+
+    max_seq_len = max(seq_lens)
+    seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int, device=device)
+
+    # Query: [B, q_len, num_q_heads, kv_lora_rank + qk_rope_head_dim]
+    query = torch.randn(
+        batch_size,
+        q_len_per_request,
+        num_q_heads,
+        kv_lora_rank + qk_rope_head_dim,
+        device=device,
+    )
+    query.clamp_(min=-1.0, max=1.0)
+    query = query.to(dtype)
+
+    page_size = 32
+    blocks_per_seq = (seq_lens_tensor + page_size - 1) // page_size
+    max_num_blocks_per_seq = blocks_per_seq.max().item()
+    total_blocks_needed = int(blocks_per_seq.sum().item())
+
+    all_block_ids = torch.randperm(total_blocks_needed, device=device)
+
+    block_tables = torch.zeros(
+        (batch_size, max_num_blocks_per_seq), dtype=torch.int, device=device
+    )
+    block_id = 0
+    for i in range(batch_size):
+        num_blocks_needed = int(blocks_per_seq[i].item())
+        block_tables[i, :num_blocks_needed] = all_block_ids[
+            block_id : block_id + num_blocks_needed
+        ]
+        block_id += num_blocks_needed
+
+    num_blocks = total_blocks_needed
+    kv_cache = torch.randn(
+        size=(num_blocks, page_size, kv_lora_rank + qk_rope_head_dim),
+        device=device,
+    )
+    kv_cache.clamp_(min=-1.0, max=1.0)
+    kv_cache = kv_cache.to(dtype)
+
+    abs_indices, indices_in_kvcache = generate_sparse_indices(
+        batch_size,
+        q_len_per_request,
+        seq_lens_tensor,
+        topk,
+        page_size,
+        block_tables,
+        device,
+    )
+
+    # Build reference KV cache (mask unused entries)
+    kv_cache_ref = kv_cache.clone()
+    if dtype == torch.float8_e4m3fn:
+        kv_cache_ref = kv_cache_ref.to(torch.bfloat16)
+
+    all_indices = indices_in_kvcache.flatten().tolist()
+    all_indices = list(set(all_indices))
+    if -1 in all_indices:
+        all_indices.remove(-1)
+
+    kv_cache_flat = kv_cache_ref.view(-1, kv_lora_rank + qk_rope_head_dim)
+    used_mask = torch.zeros(kv_cache_flat.size(0), dtype=torch.bool, device="cpu")
+    used_mask[torch.tensor(all_indices, dtype=torch.int64, device="cpu")] = True
+    kv_cache_flat[~used_mask] = float("0")
+
+    global global_workspace_buffer, global_trtllm_gen_fmha_workspace_buffer
+    if global_workspace_buffer is None:
+        global_workspace_buffer = torch.empty(
+            workspace_size, dtype=torch.int8, device=device
+        )
+    if global_trtllm_gen_fmha_workspace_buffer is None:
+        global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
+            workspace_size, dtype=torch.int8, device=device
+        )
+    workspace_buffer = global_trtllm_gen_fmha_workspace_buffer
+
+    # bmm1_scale uses original (pre-absorption) head dim for softmax scaling
+    bmm1_scale = scale / ((qk_nope_head_dim + qk_rope_head_dim) ** 0.5)
+
+    query_input = query.clone()
+    output = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+        query=query_input,
+        kv_cache=kv_cache.unsqueeze(1),
+        workspace_buffer=workspace_buffer,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        block_tables=indices_in_kvcache,
+        seq_lens=seq_lens_tensor,
+        max_seq_len=max_seq_len,
+        sparse_mla_top_k=topk,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=1.0,
+        enable_pdl=enable_pdl,
+        backend=backend,
+    )
+
+    # Check workspace counter region is zeroed
+    assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
+
+    # Check shape
+    expected_shape = (batch_size, q_len_per_request, num_q_heads, kv_lora_rank)
+    assert output.shape == expected_shape, (
+        f"Output shape {output.shape} != {expected_shape}"
+    )
+
+    # Check for NaNs
+    if dtype != torch.float8_e4m3fn:
+        assert not torch.isnan(output).any(), "Output contains NaN values"
+
+    # Reference computation
+    query_ref = query.clone()
+    if dtype == torch.float8_e4m3fn:
+        query_ref = query_ref.to(torch.bfloat16)
+
+    blocked_k = kv_cache_ref
+    blocked_v = kv_cache_ref[..., :kv_lora_rank]
+
+    out_ref, lse_ref = sparse_mla_reference_torch(
+        cache_seqlens=seq_lens_tensor,
+        block_table=block_tables,
+        q=query_ref,
+        blocked_k=blocked_k,
+        blocked_v=blocked_v,
+        page_size=page_size,
+        is_causal=True,
+        sm_scale=bmm1_scale,
+        indices=abs_indices,
+    )
+
+    assert not torch.isnan(output).any(), "Kernel output contains NaN values"
+    assert not torch.isnan(out_ref).any(), "Reference output contains NaN values"
+
+    if dtype == torch.float8_e4m3fn:
+        torch.testing.assert_close(
+            output.float(), out_ref.float(), rtol=1e-1, atol=1e-1,
+        )
+    else:
+        torch.testing.assert_close(
+            output.float(), out_ref.float(), rtol=2e-2, atol=8e-4,
+        )

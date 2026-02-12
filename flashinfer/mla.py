@@ -83,8 +83,10 @@ def _check_trtllm_gen_mla_shape(
     elif kv_cache.ndim != 4:
         raise ValueError(f"Expected kv_cache.ndim == 3 or 4, got {kv_cache.ndim}")
 
-    if qk_nope_head_dim != 128:
-        raise ValueError(f"Expected qk_nope_head_dim == 128, got {qk_nope_head_dim}")
+    # After matrix absorption, the kernel operates on absorbed dimensions:
+    #   d_qk = kv_lora_rank + qk_rope_head_dim (must be 576)
+    #   d_v  = kv_lora_rank (must be 512)
+    # The pre-absorption qk_nope_head_dim is not used by the kernel.
     if kv_lora_rank != 512:
         raise ValueError(f"Expected kv_lora_rank == 512, got {kv_lora_rank}")
     if qk_rope_head_dim != 64:
