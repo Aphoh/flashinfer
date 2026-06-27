@@ -15,7 +15,9 @@ limitations under the License.
 """
 
 import ctypes
+import ctypes.util
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch.distributed as dist
@@ -40,31 +42,41 @@ class Function:
     argtypes: List[Any]
 
 
-def find_loaded_library(lib_name) -> Optional[str]:
+def _has_symbols(library: Any, symbols: List[str]) -> bool:
+    return all(hasattr(library, symbol) for symbol in symbols)
+
+
+def find_loaded_library(
+    lib_name: str, required_symbols: Optional[List[str]] = None
+) -> Optional[str]:
     """
     According to according to https://man7.org/linux/man-pages/man5/proc_pid_maps.5.html,
     the file `/proc/self/maps` contains the memory maps of the process, which includes the
     shared libraries loaded by the process. We can use this file to find the path of the
     a loaded library.
     """  # noqa
-    found = False
+    required_symbols = required_symbols or []
+    # A process may map multiple libcudart-like objects. In SGLang, TileLang's
+    # libcudart_stub.so can appear before PyTorch's real runtime and lacks
+    # symbols such as cudaDeviceReset. Do not let /proc/self/maps ordering pick
+    # an incomplete stub; require the API that CudaRTLibrary actually wraps.
     with open("/proc/self/maps") as f:
         for line in f:
-            if lib_name in line:
-                found = True
-                break
-    if not found:
-        # the library is not loaded in the current process
-        return None
-    # if lib_name is libcudart, we need to match a line with:
-    # address /path/to/libcudart-hash.so.11.0
-    start = line.index("/")
-    path = line[start:].strip()
-    filename = path.split("/")[-1]
-    assert filename.rpartition(".so")[0].startswith(lib_name), (
-        f"Unexpected filename: {filename} for library {lib_name}"
-    )
-    return path
+            if lib_name not in line or "/" not in line:
+                continue
+            path = line[line.index("/") :].strip()
+            filename = Path(path).name
+            if not filename.rpartition(".so")[0].startswith(lib_name):
+                continue
+            if "stub" in filename:
+                continue
+            try:
+                library = ctypes.CDLL(path)
+            except OSError:
+                continue
+            if _has_symbols(library, required_symbols):
+                return path
+    return None
 
 
 class CudaRTLibrary:
@@ -121,8 +133,31 @@ class CudaRTLibrary:
 
     def __init__(self, so_file: Optional[str] = None):
         if so_file is None:
-            so_file = find_loaded_library("libcudart")
-            assert so_file is not None, "libcudart is not loaded in the current process"
+            required_symbols = [
+                function.name for function in CudaRTLibrary.exported_functions
+            ]
+            so_file = find_loaded_library("libcudart", required_symbols)
+            if so_file is None:
+                candidates = [
+                    ctypes.util.find_library("cudart"),
+                    "libcudart.so",
+                    "/usr/local/cuda/lib64/libcudart.so",
+                ]
+                for candidate in candidates:
+                    if candidate is None:
+                        continue
+                    try:
+                        library = ctypes.CDLL(candidate)
+                    except OSError:
+                        continue
+                    if _has_symbols(library, required_symbols):
+                        so_file = candidate
+                        CudaRTLibrary.path_to_library_cache[so_file] = library
+                        break
+            if so_file is None:
+                raise RuntimeError(
+                    "Could not find a CUDA runtime library with the required symbols"
+                )
         if so_file not in CudaRTLibrary.path_to_library_cache:
             lib = ctypes.CDLL(so_file)
             CudaRTLibrary.path_to_library_cache[so_file] = lib
