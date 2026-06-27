@@ -51,6 +51,8 @@ from .allreduce import (
 )
 from .checkpoint import SymmetricMemoryCheckpoint as SymmetricMemoryCheckpoint
 from .checkpoint import SymmetricMemoryState as SymmetricMemoryState
+from .allgather import SymmetricAllGatherWorkspace as SymmetricAllGatherWorkspace
+from .allgather import all_gather as all_gather
 
 # MNNVL A2A (Throughput Backend)
 from .trtllm_moe_alltoall import MoeAlltoAll as MoeAlltoAll

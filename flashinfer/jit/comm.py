@@ -202,6 +202,15 @@ def gen_trtllm_comm_module() -> JitSpec:
     )
 
 
+def gen_symmetric_allgather_module() -> JitSpec:
+    return gen_jit_spec(
+        "symmetric_allgather",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "symmetric_allgather.cu",
+        ],
+    )
+
+
 def gen_vllm_comm_module() -> JitSpec:
     return gen_jit_spec(
         "vllm_comm",
