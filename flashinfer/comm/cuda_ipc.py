@@ -56,6 +56,10 @@ def find_loaded_library(
     a loaded library.
     """  # noqa
     required_symbols = required_symbols or []
+    # A process may map multiple libcudart-like objects. In SGLang, TileLang's
+    # libcudart_stub.so can appear before PyTorch's real runtime and lacks
+    # symbols such as cudaDeviceReset. Do not let /proc/self/maps ordering pick
+    # an incomplete stub; require the API that CudaRTLibrary actually wraps.
     with open("/proc/self/maps") as f:
         for line in f:
             if lib_name not in line or "/" not in line:
