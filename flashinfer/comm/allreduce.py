@@ -112,6 +112,7 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         dtype: torch.dtype = torch.float16,
         comm_backend: Optional[CommBackend] = None,
         group: Optional[ProcessGroup] = None,
+        checkpointable: bool = False,
     ):
         """
         Create TensorRT-LLM AllReduce fusion workspace.
@@ -124,6 +125,8 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             dtype: Data type
             comm_backend: Communication backend
             group: Process group for symmetric memory rendezvous. Defaults to torch.distributed.group.WORLD.
+            checkpointable: Use graph-address-stable CUDA VMM allocations that
+                can detach their process-specific backing for checkpointing.
         """
         super().__init__(tp_size, tp_rank)
 
@@ -138,6 +141,7 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             create_metadata=True,
             use_fp32_lamport=dtype == torch.float32,
             use_symm_dev_mem=True,
+            checkpointable=checkpointable,
         )
 
         # Store essential attributes for easy access
@@ -150,9 +154,12 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         self.workspace_tensor = workspace_tuple[1]
         self.mem_handles = workspace_tuple[2]
         self.metadata = workspace_tuple[3]
-        self._memory_checkpoints = [
-            SymmetricMemoryCheckpoint(memory) for memory in self.mem_handles
-        ]
+        self.checkpointable = checkpointable
+        self._memory_checkpoints = (
+            [SymmetricMemoryCheckpoint(memory) for memory in self.mem_handles]
+            if checkpointable
+            else []
+        )
         self._checkpoint_workspace_ptrs: Optional[List[List[int]]] = None
 
     @property
@@ -168,6 +175,8 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         """Detach process-specific CUDA backing before a process checkpoint."""
         if self._destroyed:
             raise RuntimeError("cannot checkpoint a destroyed workspace")
+        if not self.checkpointable:
+            raise RuntimeError("workspace was not created with checkpointable=True")
         if not self.checkpoint_detached:
             torch.cuda.synchronize()
         if self._checkpoint_workspace_ptrs is None:
@@ -179,6 +188,8 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         """Renew handles and restore backing at CUDA-graph-stable addresses."""
         if self._destroyed:
             raise RuntimeError("cannot restore a destroyed workspace")
+        if not self.checkpointable:
+            raise RuntimeError("workspace was not created with checkpointable=True")
         if self._checkpoint_workspace_ptrs is None:
             return
 
@@ -340,6 +351,7 @@ def create_allreduce_fusion_workspace(
     comm_backend: Optional[CommBackend] = None,
     force_oneshot_support: bool = False,
     group: Optional[ProcessGroup] = None,
+    checkpointable: bool = False,
 ) -> AllReduceFusionWorkspace:
     r"""Create workspace for AllReduce fusion operations.
 
@@ -384,6 +396,10 @@ def create_allreduce_fusion_workspace(
     group : Optional[ProcessGroup]
         Process group used for symmetric-memory rendezvous (TRT-LLM backend
         only). Defaults to ``torch.distributed.group.WORLD``.
+    checkpointable : bool
+        If ``True``, the TRT-LLM backend uses CUDA VMM-backed symmetric memory
+        that can renew its backing after a process checkpoint without changing
+        graph-visible addresses. Defaults to ``False``.
 
     Returns
     -------
@@ -478,9 +494,12 @@ def create_allreduce_fusion_workspace(
             dtype=dtype,
             comm_backend=comm_backend,
             group=group,
+            checkpointable=checkpointable,
         )
 
     elif actual_backend == "mnnvl":
+        if checkpointable:
+            raise ValueError("checkpointable workspaces require backend='trtllm'")
         mapping = Mapping(
             world_size=world_size,
             rank=rank,

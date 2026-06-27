@@ -564,6 +564,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     create_metadata: bool = False,
     comm_backend: Optional[CommBackend] = None,
     use_symm_dev_mem: bool = False,
+    checkpointable: bool = False,
 ) -> Union[
     Tuple[List[List[int]], torch.Tensor],
     Tuple[List[List[int]], torch.Tensor, dict],
@@ -580,6 +581,8 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     - create_metadata: if True, return metadata dict as third element (default: False).
     - comm_backend: the communication backend to use.
     - use_symm_dev_mem: if True, we will use symmetric device memory for the workspace.
+    - checkpointable: if True, use CUDA VMM-backed symmetric memory whose backing
+      can be detached and renewed while preserving graph-visible addresses.
 
     Returns:
     - If create_metadata=False: (ipc_handles, workspace_tensor)
@@ -616,6 +619,8 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     # No need to support all variations. In the future we only support create_metadata=True and use_symm_dev_mem=True.
     if use_symm_dev_mem and not create_metadata:
         raise ValueError("use_symm_dev_mem is only supported when create_metadata=True")
+    if checkpointable and not use_symm_dev_mem:
+        raise ValueError("checkpointable requires use_symm_dev_mem=True")
 
     buffer_size = tp_size * max_token_num * hidden_dim * 2
     flag_size = tp_size * BarrierFlagCount * 4
@@ -653,15 +658,28 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
         (flag_size, torch.int32),
         (lamport_buffer_size, lamport_buffer_dtype),
     ]:
-        aligned_size = round_up(size, 16)
-
-        ptrs, tensor, handle = _alloc_symm_buffer_bytes(
-            aligned_size,
-            tp_size,
-            dtype,
-            device,
-            group_name,
-        )
+        if checkpointable:
+            aligned_size = round_up(size, 1 << 21)
+            handle = SymmDeviceMemory(
+                aligned_size,
+                tp_size,
+                tp_rank,
+                torch.cuda.current_device(),
+                comm_backend,
+                enable_multicast=False,
+                allocate_signal_pads=False,
+            )
+            ptrs = handle.uc_ptrs
+            tensor = None
+        else:
+            aligned_size = round_up(size, 16)
+            ptrs, tensor, handle = _alloc_symm_buffer_bytes(
+                aligned_size,
+                tp_size,
+                dtype,
+                device,
+                group_name,
+            )
         symm_refs.append((tensor, handle))
         ipc_handles.append(ptrs)
         mem_handles.append(handle)
@@ -739,6 +757,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
             "flag_size": flag_size,
             "lamport_comm_size": lamport_comm_size,
             "lamport_buffer_size": lamport_buffer_size,
+            "checkpointable": checkpointable,
         }
         if use_symm_dev_mem:
             return ipc_handles, workspace_tensor, mem_handles, metadata

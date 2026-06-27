@@ -163,6 +163,7 @@ def test_allreduce_workspace_reset_failure_can_retry(monkeypatch):
 
     workspace = object.__new__(allreduce.TRTLLMAllReduceFusionWorkspace)
     workspace._destroyed = False
+    workspace.checkpointable = True
     workspace.ipc_handles = [[100], [200], [300]]
     workspace.workspace_tensor = object()
     workspace.mem_handles = []
@@ -197,3 +198,39 @@ def test_allreduce_workspace_reset_failure_can_retry(monkeypatch):
     assert reset_calls == 2
     assert backend.barriers == 1
     assert workspace._checkpoint_workspace_ptrs is None
+
+
+def test_workspace_only_wraps_checkpointable_memory(monkeypatch):
+    memory = make_memory()
+    calls = []
+
+    def create_workspace(**kwargs):
+        calls.append(kwargs)
+        return [[100], [200], [300]], object(), [memory], {}
+
+    monkeypatch.setattr(
+        allreduce,
+        "trtllm_create_ipc_workspace_for_all_reduce_fusion",
+        create_workspace,
+    )
+
+    standard = allreduce.TRTLLMAllReduceFusionWorkspace(
+        tp_size=1,
+        tp_rank=0,
+        max_token_num=1,
+        hidden_dim=1,
+    )
+    assert calls[-1]["checkpointable"] is False
+    assert standard._memory_checkpoints == []
+    with pytest.raises(RuntimeError, match="checkpointable=True"):
+        standard.prepare_checkpoint()
+
+    checkpointable = allreduce.TRTLLMAllReduceFusionWorkspace(
+        tp_size=1,
+        tp_rank=0,
+        max_token_num=1,
+        hidden_dim=1,
+        checkpointable=True,
+    )
+    assert calls[-1]["checkpointable"] is True
+    assert len(checkpointable._memory_checkpoints) == 1
