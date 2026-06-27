@@ -63,6 +63,7 @@ from flashinfer.trace.templates.comm import allreduce_fusion_trace
 
 from .trtllm_ar import trtllm_allreduce_fusion
 from .trtllm_ar import trtllm_create_ipc_workspace_for_all_reduce_fusion
+from .trtllm_ar import trtllm_reset_ipc_workspace_for_all_reduce_fusion
 from .trtllm_ar import check_trtllm_allreduce_fusion_workspace_metadata
 from .trtllm_ar import trtllm_moe_allreduce_fusion
 from .trtllm_ar import trtllm_moe_finalize_allreduce_fusion
@@ -70,6 +71,7 @@ from .trtllm_ar import trtllm_moe_finalize_allreduce_fusion
 from .mapping import Mapping
 
 from .mnnvl import CommBackend, SymmDeviceMemory
+from .checkpoint import SymmetricMemoryCheckpoint
 
 # Note: AllReduceFusionPattern and QuantizationSFLayout are pseudo-types (classes with int constants)
 # Import them for runtime use but type hint as int for mypy compatibility
@@ -148,10 +150,49 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         self.workspace_tensor = workspace_tuple[1]
         self.mem_handles = workspace_tuple[2]
         self.metadata = workspace_tuple[3]
+        self._memory_checkpoints = [
+            SymmetricMemoryCheckpoint(memory) for memory in self.mem_handles
+        ]
+        self._checkpoint_workspace_ptrs: Optional[List[List[int]]] = None
 
     @property
     def backend(self) -> str:
         return "trtllm"
+
+    @property
+    def checkpoint_detached(self) -> bool:
+        """Whether any graph-visible symmetric allocation is detached."""
+        return any(not checkpoint.attached for checkpoint in self._memory_checkpoints)
+
+    def prepare_checkpoint(self) -> None:
+        """Detach process-specific CUDA backing before a process checkpoint."""
+        if self._destroyed:
+            raise RuntimeError("cannot checkpoint a destroyed workspace")
+        if not self.checkpoint_detached:
+            torch.cuda.synchronize()
+        if self._checkpoint_workspace_ptrs is None:
+            self._checkpoint_workspace_ptrs = [list(ptrs) for ptrs in self.ipc_handles]
+        for checkpoint in self._memory_checkpoints:
+            checkpoint.detach()
+
+    def restore_after_checkpoint(self, comm_backend: CommBackend) -> None:
+        """Renew handles and restore backing at CUDA-graph-stable addresses."""
+        if self._destroyed:
+            raise RuntimeError("cannot restore a destroyed workspace")
+        if self._checkpoint_workspace_ptrs is None:
+            return
+
+        for checkpoint in self._memory_checkpoints:
+            checkpoint.restore(comm_backend)
+        trtllm_reset_ipc_workspace_for_all_reduce_fusion(
+            self.workspace_tensor, self.mem_handles, self.metadata
+        )
+        if self.ipc_handles != self._checkpoint_workspace_ptrs:
+            raise RuntimeError(
+                "graph-visible all-reduce workspace pointers changed on restore"
+            )
+        comm_backend.barrier()
+        self._checkpoint_workspace_ptrs = None
 
     def __getattr__(self, name):
         """Delegate attribute access to internal workspace if not found."""
@@ -187,6 +228,7 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         del self.workspace_tensor
         del self.mem_handles
         del self.metadata
+        del self._memory_checkpoints
         self._destroyed = True
 
 

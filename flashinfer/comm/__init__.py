@@ -49,6 +49,8 @@ from .allreduce import allreduce_fusion as allreduce_fusion
 from .allreduce import (
     create_allreduce_fusion_workspace as create_allreduce_fusion_workspace,
 )
+from .checkpoint import SymmetricMemoryCheckpoint as SymmetricMemoryCheckpoint
+from .checkpoint import SymmetricMemoryState as SymmetricMemoryState
 
 # MNNVL A2A (Throughput Backend)
 from .trtllm_moe_alltoall import MoeAlltoAll as MoeAlltoAll

@@ -749,6 +749,27 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
         return ipc_handles, workspace_tensor
 
 
+def trtllm_reset_ipc_workspace_for_all_reduce_fusion(
+    workspace_tensor: torch.Tensor,
+    mem_handles: List[SymmDeviceMemory],
+    metadata: dict,
+) -> None:
+    """Reset graph-stable TRT-LLM all-reduce state after remapping memory."""
+    lamport_dtype = (
+        torch.float32 if metadata.get("use_fp32_lamport", False) else torch.float16
+    )
+    mem_handles[2].lamport_initialize(metadata["tp_rank"], lamport_dtype)
+
+    flag_ptr = int(workspace_tensor[-1].item())
+    cudart.cudaMemset(flag_ptr, 0, 5 * 4)
+    lamport_comm_size_bytes = metadata["lamport_comm_size"].to_bytes(
+        4, byteorder="little"
+    )
+    cudart.cudaMemcpy(
+        c_void_p(flag_ptr + 3 * 4), cast(lamport_comm_size_bytes, c_void_p), 4
+    )
+
+
 def trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
     workspace: List[List[int]], group: Optional[ProcessGroup] = None
 ) -> None:
